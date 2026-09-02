@@ -53,9 +53,25 @@ set -euo pipefail
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 timestamp()  { date '+%Y-%m-%d %H:%M:%S'; }
-log()        { echo "$(timestamp) $*"; }
+log() {
+    local msg; msg="$(timestamp) $*"
+    if [ -f "${_PROGRESS_LOG_QUIET:-/nonexistent}" ] 2>/dev/null; then
+        echo "$msg" >> "${_PROGRESS_LOG_QUIET}.buf"
+    else
+        echo "$msg"
+    fi
+}
 log_phase()  { echo ""; echo "$(timestamp) ══════ $* ══════"; echo ""; }
 die()        { echo ""; echo "ERROR: $*" >&2; exit 1; }
+
+_progress_quiet_start() { touch "${_PROGRESS_LOG_QUIET}"; }
+_progress_quiet_stop()  {
+    rm -f "${_PROGRESS_LOG_QUIET}"
+    if [ -s "${_PROGRESS_LOG_QUIET}.buf" ]; then
+        cat "${_PROGRESS_LOG_QUIET}.buf"
+        rm -f "${_PROGRESS_LOG_QUIET}.buf"
+    fi
+}
 
 START_TIME=$(date +%s)
 
@@ -152,11 +168,15 @@ df -h "${STAGING_DIR}"
 # ═════════════════════════════════════════════════════════════════════════════
 SRC_TOKEN_FILE=$(mktemp /tmp/vcd_src_token_XXXXXX.txt)
 DST_TOKEN_FILE=$(mktemp /tmp/vcd_dst_token_XXXXXX.txt)
+# Quiet-mode sentinel: when this file exists, log() buffers to file instead of terminal.
+# Defined here so token_refresh_daemon (started below) inherits the path.
+_PROGRESS_LOG_QUIET="${LOG_DIR}/.progress_quiet_$$"
 
 cleanup() {
     log "Cleaning up temp files and background jobs …"
     kill -- -$$ 2>/dev/null || kill 0 2>/dev/null || true
-    rm -f "${SRC_TOKEN_FILE}" "${DST_TOKEN_FILE}"
+    rm -f "${SRC_TOKEN_FILE}" "${DST_TOKEN_FILE}" \
+          "${_PROGRESS_LOG_QUIET}" "${_PROGRESS_LOG_QUIET}.buf" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -896,9 +916,11 @@ else
         [[ "$_pfs" =~ ^[0-9]+$ ]] && _dl_total_pending=$(( _dl_total_pending + _pfs ))
     done < "${OVF_FILE_LIST}"
 
-    # Start the multi-file progress display when downloading in parallel
+    # Start the multi-file progress display when downloading in parallel.
+    # Quiet mode buffers log() output so token-refresh messages don't corrupt the display.
     _DL_AGG_PID=0
     if [ "$DL_FILE_PARALLEL_JOBS" -gt 1 ] && [ "$_dl_total_pending" -gt 0 ]; then
+        _progress_quiet_start
         _multifile_progress_daemon \
             "$DL_FILE_PARALLEL_JOBS" "$_dl_total_pending" "$(date +%s%N)" \
             "${_DL_STATE_DIR}" "${_DL_DONE_BYTES_FILE}" &
@@ -1014,11 +1036,12 @@ else
         fi
     done
 
-    # Stop the progress display and clean up shared state
+    # Stop the progress display, restore log() terminal output, flush buffered messages
     if [ "$_DL_AGG_PID" -ne 0 ]; then
         kill "$_DL_AGG_PID" 2>/dev/null || true
         wait "$_DL_AGG_PID" 2>/dev/null || true
         printf '\n' >&2
+        _progress_quiet_stop
     fi
     rm -rf "${_DL_STATE_DIR}" "${_DL_DONE_BYTES_FILE}"
 
@@ -1612,7 +1635,8 @@ else
         done
     }
 
-    # Start the monitor in background; redirect its output straight to the terminal
+    # Start the monitor in background; quiet mode prevents log() from corrupting the display
+    _progress_quiet_start
     _progress_monitor "${UL_CHUNK_LOG}" "${UL_PROGRESS_FILE}" "${_UL_TOTAL_BYTES}" &
     _PROGRESS_PID=$!
 
@@ -1865,10 +1889,11 @@ else
         if ! wait "$pid"; then ul_failed=1; fi
     done
 
-    # Signal progress monitor to do a final render and exit
+    # Signal progress monitor to do a final render and exit; flush buffered log messages
     touch "${UL_PROGRESS_FILE}.done"
     wait "$_PROGRESS_PID" 2>/dev/null || true
     rm -f "${UL_PROGRESS_FILE}" "${UL_PROGRESS_FILE}.done"
+    _progress_quiet_stop
 
     if [ "$ul_failed" -ne 0 ]; then
         tail -40 "${UL_CHUNK_LOG}" >&2
