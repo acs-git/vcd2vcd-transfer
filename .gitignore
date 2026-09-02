@@ -2,3 +2,5 @@ vcd2vcd_mp_manual.sh
 vcd2vcd_mp_vcd_oci.sh
 *.log
 tom
+vcd2vcd_multipart.env
+.vcd2vcd_multipart.env
